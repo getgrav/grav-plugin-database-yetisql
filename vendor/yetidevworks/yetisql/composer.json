@@ -1,0 +1,45 @@
+{
+    "name": "yetidevworks/yetisql",
+    "description": "A pure-PHP, SQLite-compatible embedded SQL database. Zero extensions, single committable file, PDO-shaped API.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["sqlite", "database", "sql", "embedded", "pure-php", "flat-file", "pdo"],
+    "authors": [
+        {
+            "name": "Andy Miller",
+            "email": "andy@trilbymedia.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.3"
+    },
+    "require-dev": {
+        "doctrine/dbal": "^4.4",
+        "illuminate/database": "^11.0 || ^12.0 || ^13.0",
+        "phpunit/phpunit": "^11.0"
+    },
+    "suggest": {
+        "illuminate/database": "Use the Eloquent/Laravel adapter (YetiDevWorks\\YetiSQL\\Eloquent) to back Eloquent with YetiSQL (^11.0 || ^12.0 || ^13.0)",
+        "doctrine/dbal": "Use the Doctrine DBAL driver (YetiDevWorks\\YetiSQL\\Doctrine) to back Doctrine with YetiSQL (^4.4)"
+    },
+    "autoload": {
+        "psr-4": {
+            "YetiDevWorks\\YetiSQL\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "YetiDevWorks\\YetiSQL\\Tests\\": "tests/"
+        }
+    },
+    "bin": ["bin/yetisql"],
+    "scripts": {
+        "test": "phpunit",
+        "test-unit": "phpunit --testsuite unit"
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true
+    },
+    "minimum-stability": "stable"
+}

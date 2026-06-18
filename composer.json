@@ -1,0 +1,32 @@
+{
+  "name": "getgrav/grav-plugin-database-yetisql",
+  "type": "grav-plugin",
+  "description": "Adds the pure-PHP YetiSQL engine as a connection type for the Grav Database plugin",
+  "keywords": ["grav", "plugin", "database", "yetisql", "sqlite", "pure-php"],
+  "homepage": "https://github.com/getgrav/grav-plugin-database-yetisql",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Team Grav",
+      "email": "devs@getgrav.org",
+      "homepage": "https://getgrav.org"
+    }
+  ],
+  "autoload": {
+    "psr-4": {
+      "Grav\\Plugin\\DatabaseYetiSQL\\": "classes/"
+    }
+  },
+  "require": {
+    "php": ">=8.3",
+    "yetidevworks/yetisql": "^1.0"
+  },
+  "config": {
+    "platform": {
+      "php": "8.3"
+    }
+  },
+  "scripts": {
+    "test": "php tests/run.php"
+  }
+}

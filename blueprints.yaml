@@ -1,0 +1,38 @@
+name: Database YetiSQL
+slug: database-yetisql
+type: plugin
+version: 1.0.0
+description: Adds the pure-PHP YetiSQL engine as a connection type for the Database plugin
+icon: database
+author:
+  name: Team Grav
+  email: devs@getgrav.org
+  url: https://getgrav.org
+homepage: https://github.com/getgrav/grav-plugin-database-yetisql
+keywords: grav, plugin, database, yetisql, sqlite, pure-php
+bugs: https://github.com/getgrav/grav-plugin-database-yetisql/issues
+docs: https://github.com/getgrav/grav-plugin-database-yetisql/blob/develop/README.md
+license: MIT
+
+# YetiSQL uses PHP 8 syntax; the engine requires PHP 8.3+ (enforced in composer.json).
+# It works on both Grav 1.7 and 2.0 as long as the host PHP is 8.3 or newer.
+compatibility:
+  grav: ['1.7', '2.0']
+
+dependencies:
+  - { name: grav, version: ">=1.7.0" }
+  - { name: database, version: ">=1.2.0" }
+
+form:
+  validation: strict
+  fields:
+    enabled:
+      type: toggle
+      label: PLUGIN_ADMIN.PLUGIN_STATUS
+      highlight: 1
+      default: 0
+      options:
+        1: PLUGIN_ADMIN.ENABLED
+        0: PLUGIN_ADMIN.DISABLED
+      validate:
+        type: bool

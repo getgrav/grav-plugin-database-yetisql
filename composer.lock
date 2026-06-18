@@ -1,0 +1,85 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "b8e6f62a665a93b3ebfd2a2ffef70f5b",
+    "packages": [
+        {
+            "name": "yetidevworks/yetisql",
+            "version": "v1.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/yetidevworks/YetiSQL.git",
+                "reference": "56e4de1e42d709cac445020319d9861afe3de996"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/yetidevworks/YetiSQL/zipball/56e4de1e42d709cac445020319d9861afe3de996",
+                "reference": "56e4de1e42d709cac445020319d9861afe3de996",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=8.3"
+            },
+            "require-dev": {
+                "doctrine/dbal": "^4.4",
+                "illuminate/database": "^11.0 || ^12.0 || ^13.0",
+                "phpunit/phpunit": "^11.0"
+            },
+            "suggest": {
+                "doctrine/dbal": "Use the Doctrine DBAL driver (YetiDevWorks\\YetiSQL\\Doctrine) to back Doctrine with YetiSQL (^4.4)",
+                "illuminate/database": "Use the Eloquent/Laravel adapter (YetiDevWorks\\YetiSQL\\Eloquent) to back Eloquent with YetiSQL (^11.0 || ^12.0 || ^13.0)"
+            },
+            "bin": [
+                "bin/yetisql"
+            ],
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "YetiDevWorks\\YetiSQL\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Andy Miller",
+                    "email": "andy@trilbymedia.com"
+                }
+            ],
+            "description": "A pure-PHP, SQLite-compatible embedded SQL database. Zero extensions, single committable file, PDO-shaped API.",
+            "keywords": [
+                "database",
+                "embedded",
+                "flat-file",
+                "pdo",
+                "pure-php",
+                "sql",
+                "sqlite"
+            ],
+            "support": {
+                "issues": "https://github.com/yetidevworks/YetiSQL/issues",
+                "source": "https://github.com/yetidevworks/YetiSQL/tree/v1.0.0"
+            },
+            "time": "2026-06-18T20:39:24+00:00"
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {},
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {
+        "php": ">=8.3"
+    },
+    "platform-dev": {},
+    "platform-overrides": {
+        "php": "8.3"
+    },
+    "plugin-api-version": "2.9.0"
+}
