@@ -51,6 +51,18 @@ final class BTreePage
     /** Running sum of strlen() over $cells, maintained by the mutators. */
     private int $contentBytes = 0;
 
+    /**
+     * Lazily-built cache of each cell's decoded search key, aligned with
+     * $cells: the rowid for table pages, the separator rowid for table
+     * interiors, the decoded key record for index pages. Built on demand by
+     * the owning b-tree so binary searches skip re-decoding cell bytes on
+     * every probe. Mutators reset it to null; hot paths that know the new
+     * key may reassign an updated array instead of forcing a rebuild.
+     *
+     * @var list<mixed>|null
+     */
+    public ?array $keyCache = null;
+
     public function __construct(int $type)
     {
         $this->type = $type;
@@ -60,24 +72,28 @@ final class BTreePage
     {
         $this->cells[] = $cell;
         $this->contentBytes += \strlen($cell);
+        $this->keyCache = null;
     }
 
     public function insertCell(int $index, string $cell): void
     {
         \array_splice($this->cells, $index, 0, [$cell]);
         $this->contentBytes += \strlen($cell);
+        $this->keyCache = null;
     }
 
     public function removeCell(int $index): void
     {
         $this->contentBytes -= \strlen($this->cells[$index]);
         \array_splice($this->cells, $index, 1);
+        $this->keyCache = null;
     }
 
     public function replaceCell(int $index, string $cell): void
     {
         $this->contentBytes += \strlen($cell) - \strlen($this->cells[$index]);
         $this->cells[$index] = $cell;
+        $this->keyCache = null;
     }
 
     /** Replace the whole cell list, recomputing the byte sum once. */
@@ -89,6 +105,7 @@ final class BTreePage
             $bytes += \strlen($c);
         }
         $this->contentBytes = $bytes;
+        $this->keyCache = null;
     }
 
     public function isLeaf(): bool

@@ -30,6 +30,16 @@ final class Schema
     /** @var array<string,CreateTriggerStatement> lower-cased trigger name => AST */
     private array $triggers = [];
 
+    /**
+     * Memoized resolvedIndexes() results, keyed by lower-cased table name and
+     * validated against the pager's schema cookie (every DDL bumps it, and
+     * load() clears the cache outright for rollback/cross-process reloads).
+     *
+     * @var array<string,list<IndexInfo>>
+     */
+    private array $resolvedIndexCache = [];
+    private int $resolvedIndexCookie = -1;
+
     private TableBTree $master;
 
     public function __construct(private readonly Pager $pager)
@@ -44,6 +54,8 @@ final class Schema
         $this->indexes = [];
         $this->views = [];
         $this->triggers = [];
+        $this->resolvedIndexCache = [];
+        $this->resolvedIndexCookie = -1;
         foreach ($this->master->scan() as [$rowid, $payload]) {
             $r = RecordCodec::decode($payload);
             [$type, $name, $tblName, $rootPage, $sql] = [$r[0], $r[1], $r[2], $r[3], $r[4]];
@@ -158,6 +170,16 @@ final class Schema
      */
     public function resolvedIndexes(string $table): array
     {
+        $cookie = $this->pager->schemaCookie();
+        if ($cookie !== $this->resolvedIndexCookie) {
+            $this->resolvedIndexCache = [];
+            $this->resolvedIndexCookie = $cookie;
+        }
+        $lc = \strtolower($table);
+        if (isset($this->resolvedIndexCache[$lc])) {
+            return $this->resolvedIndexCache[$lc];
+        }
+
         $info = $this->getTable($table);
         if ($info === null) {
             return [];
@@ -192,7 +214,7 @@ final class Schema
                 );
             }
         }
-        return $out;
+        return $this->resolvedIndexCache[$lc] = $out;
     }
 
     public function createTable(CreateTableStatement $stmt): TableInfo

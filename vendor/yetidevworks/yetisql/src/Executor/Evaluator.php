@@ -212,9 +212,10 @@ final class Evaluator
     /** Resolve a column reference to a slot position, -1 for rowid, or null. */
     private function compileColPos(Expr $e, TableInfo $info, string $alias): ?int
     {
-        if ($e->table !== null
-            && \strcasecmp($e->table, $alias) !== 0
-            && \strcasecmp($e->table, $info->name) !== 0) {
+        // The alias (which defaults to the table name) is the ONLY qualifier
+        // that names this table, matching SQLite: inside "FROM t AS t2", "t.x"
+        // does not refer to this table.
+        if ($e->table !== null && \strcasecmp($e->table, $alias) !== 0) {
             return null;
         }
         $pos = $info->columnPos((string) $e->name);

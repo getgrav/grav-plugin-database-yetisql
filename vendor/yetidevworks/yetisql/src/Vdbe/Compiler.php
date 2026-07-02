@@ -223,9 +223,9 @@ final class Compiler
     /** Column position, -1 for rowid, or null if it is not this table's column. */
     private function columnPos(Expr $e): ?int
     {
-        if ($e->table !== null
-            && \strcasecmp($e->table, $this->alias) !== 0
-            && \strcasecmp($e->table, $this->info->name) !== 0) {
+        // The alias (defaulting to the table name) is the ONLY qualifier that
+        // names this table — an explicit alias replaces the table name (SQLite).
+        if ($e->table !== null && \strcasecmp($e->table, $this->alias) !== 0) {
             return null;
         }
         $name = \strtolower((string) $e->name);

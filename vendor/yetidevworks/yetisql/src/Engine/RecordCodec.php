@@ -19,9 +19,19 @@ namespace YetiDevWorks\YetiSQL\Engine;
  *   N>=13 odd   TEXT of (N-13)/2 bytes
  *
  * Accepted PHP value types: null, int, float, string (TEXT), Blob (binary).
+ *
+ * The hot paths here are deliberately written as flat inline loops: this is
+ * the per-row cost of every read and write, and in PHP the function call and
+ * the throwaway [value, consumed] tuple cost more than the byte-twiddling
+ * they wrap. Varint reads inline their single-byte fast path (serial types
+ * and header lengths are almost always < 0x80) and fall back to
+ * Varint::decode only for multi-byte forms.
  */
 final class RecordCodec
 {
+    /** Body byte length for serial types 0..9 (7 is an 8-byte float). */
+    private const BODY_LEN = [0, 1, 2, 3, 4, 6, 8, 8, 0, 0];
+
     /**
      * @param list<null|int|float|string|Blob> $values
      */
@@ -32,29 +42,66 @@ final class RecordCodec
 
         foreach ($values as $v) {
             if ($v === null) {
-                $serials .= Varint::encode(0);
+                $serials .= "\x00";
             } elseif (\is_int($v)) {
-                [$type, $bytes] = self::encodeInt($v);
-                $serials .= Varint::encode($type);
-                $body .= $bytes;
+                if ($v === 0) {
+                    $serials .= "\x08";
+                } elseif ($v === 1) {
+                    $serials .= "\x09";
+                } elseif ($v >= -128 && $v <= 127) {
+                    $serials .= "\x01";
+                    $body .= \chr($v & 0xFF);
+                } elseif ($v >= -32768 && $v <= 32767) {
+                    $serials .= "\x02";
+                    $body .= \chr(($v >> 8) & 0xFF) . \chr($v & 0xFF);
+                } elseif ($v >= -8388608 && $v <= 8388607) {
+                    $serials .= "\x03";
+                    $body .= \chr(($v >> 16) & 0xFF) . \chr(($v >> 8) & 0xFF) . \chr($v & 0xFF);
+                } elseif ($v >= -2147483648 && $v <= 2147483647) {
+                    $serials .= "\x04";
+                    $body .= \pack('N', $v & 0xFFFFFFFF);
+                } elseif ($v >= -140737488355328 && $v <= 140737488355327) {
+                    // 48-bit: take low 6 bytes of the 64-bit big-endian form.
+                    $serials .= "\x05";
+                    $body .= \substr(\pack('J', $v), 2);
+                } else {
+                    $serials .= "\x06";
+                    $body .= \pack('J', $v);
+                }
             } elseif (\is_float($v)) {
-                $serials .= Varint::encode(7);
-                $body .= self::packFloat($v);
+                $serials .= "\x07";
+                $body .= \pack('E', $v);
             } elseif ($v instanceof Blob) {
-                $len = \strlen($v->bytes);
-                $serials .= Varint::encode(12 + $len * 2);
+                $t = 12 + \strlen($v->bytes) * 2;
+                if ($t < 0x80) {
+                    $serials .= \chr($t);
+                } elseif ($t < 0x4000) {
+                    $serials .= \chr(0x80 | ($t >> 7)) . \chr($t & 0x7F);
+                } else {
+                    $serials .= Varint::encode($t);
+                }
                 $body .= $v->bytes;
             } else {
                 // TEXT
                 $s = (string) $v;
-                $len = \strlen($s);
-                $serials .= Varint::encode(13 + $len * 2);
+                $t = 13 + \strlen($s) * 2;
+                if ($t < 0x80) {
+                    $serials .= \chr($t);
+                } elseif ($t < 0x4000) {
+                    $serials .= \chr(0x80 | ($t >> 7)) . \chr($t & 0x7F);
+                } else {
+                    $serials .= Varint::encode($t);
+                }
                 $body .= $s;
             }
         }
 
         // Header length is self-describing: it counts its own varint too.
         $headerBodyLen = \strlen($serials);
+        if ($headerBodyLen < 0x7F) {
+            // Overwhelmingly common: the whole header fits a single length byte.
+            return \chr($headerBodyLen + 1) . $serials . $body;
+        }
         $sizeOfLen = Varint::size($headerBodyLen + 1);
         // Re-derive if adding the length varint pushed the total into another byte.
         $headerLen = $headerBodyLen + $sizeOfLen;
@@ -70,21 +117,83 @@ final class RecordCodec
      */
     public static function decode(string $record): array
     {
-        [$headerLen, $hOff] = Varint::decode($record, 0);
-        $serialTypes = [];
-        $p = $hOff;
+        $b = \ord($record[0]);
+        if ($b < 0x80) {
+            $headerLen = $b;
+            $p = 1;
+        } else {
+            [$headerLen, $p] = Varint::decode($record, 0);
+        }
+
+        $types = [];
         while ($p < $headerLen) {
-            [$type, $n] = Varint::decode($record, $p);
-            $serialTypes[] = $type;
-            $p += $n;
+            $b = \ord($record[$p]);
+            if ($b < 0x80) {
+                $types[] = $b;
+                $p++;
+            } else {
+                [$t, $n] = Varint::decode($record, $p);
+                $types[] = $t;
+                $p += $n;
+            }
         }
 
         $values = [];
-        $body = $headerLen;
-        foreach ($serialTypes as $type) {
-            [$value, $consumed] = self::decodeValue($type, $record, $body);
-            $values[] = $value;
-            $body += $consumed;
+        $off = $headerLen;
+        foreach ($types as $t) {
+            if ($t >= 13) {
+                if (($t & 1) === 1) { // TEXT
+                    $len = ($t - 13) >> 1;
+                    $values[] = \substr($record, $off, $len);
+                    $off += $len;
+                } else { // BLOB
+                    $len = ($t - 12) >> 1;
+                    $values[] = new Blob(\substr($record, $off, $len));
+                    $off += $len;
+                }
+            } elseif ($t === 0) {
+                $values[] = null;
+            } elseif ($t === 1) {
+                $v = \ord($record[$off]);
+                $values[] = $v >= 0x80 ? $v - 0x100 : $v;
+                $off++;
+            } elseif ($t === 8) {
+                $values[] = 0;
+            } elseif ($t === 9) {
+                $values[] = 1;
+            } elseif ($t === 2) {
+                $v = (\ord($record[$off]) << 8) | \ord($record[$off + 1]);
+                $values[] = $v >= 0x8000 ? $v - 0x10000 : $v;
+                $off += 2;
+            } elseif ($t === 3) {
+                $v = (\ord($record[$off]) << 16) | (\ord($record[$off + 1]) << 8) | \ord($record[$off + 2]);
+                $values[] = $v >= 0x800000 ? $v - 0x1000000 : $v;
+                $off += 3;
+            } elseif ($t === 4) {
+                /** @var array{1:int} $u */
+                $u = \unpack('N', $record, $off);
+                $v = $u[1];
+                $values[] = $v >= 0x80000000 ? $v - 0x100000000 : $v;
+                $off += 4;
+            } elseif ($t === 7) {
+                /** @var array{1:float} $u */
+                $u = \unpack('E', $record, $off);
+                $values[] = $u[1];
+                $off += 8;
+            } elseif ($t === 6) {
+                /** @var array{1:int} $u */
+                $u = \unpack('J', $record, $off);
+                $values[] = $u[1];
+                $off += 8;
+            } elseif ($t === 5) {
+                /** @var array{1:int} $u */
+                $u = \unpack('N', $record, $off + 2);
+                $v = ((\ord($record[$off]) << 40) | (\ord($record[$off + 1]) << 32) | $u[1]);
+                $values[] = $v >= 0x800000000000 ? $v - 0x1000000000000 : $v;
+                $off += 6;
+            } else { // 12 (empty BLOB) — 10/11 are reserved and never produced
+                $values[] = $t === 12 ? new Blob('') : null;
+            }
         }
 
         return $values;
@@ -96,18 +205,28 @@ final class RecordCodec
      */
     public static function decodeColumn(string $record, int $index): null|int|float|string|Blob
     {
-        [$headerLen, $hOff] = Varint::decode($record, 0);
-        $p = $hOff;
+        $b = \ord($record[0]);
+        if ($b < 0x80) {
+            $headerLen = $b;
+            $p = 1;
+        } else {
+            [$headerLen, $p] = Varint::decode($record, 0);
+        }
         $body = $headerLen;
         $i = 0;
         while ($p < $headerLen) {
-            [$type, $n] = Varint::decode($record, $p);
-            $p += $n;
-            $len = self::bodyLength($type);
-            if ($i === $index) {
-                return self::decodeValue($type, $record, $body)[0];
+            $b = \ord($record[$p]);
+            if ($b < 0x80) {
+                $type = $b;
+                $p++;
+            } else {
+                [$type, $n] = Varint::decode($record, $p);
+                $p += $n;
             }
-            $body += $len;
+            if ($i === $index) {
+                return self::decodeAt($record, $type, $body);
+            }
+            $body += $type >= 12 ? ($type - 12 - ($type & 1)) >> 1 : self::BODY_LEN[$type];
             $i++;
         }
         return null;
@@ -123,15 +242,27 @@ final class RecordCodec
      */
     public static function columnOffsets(string $record): array
     {
-        [$headerLen, $p] = Varint::decode($record, 0);
+        $b = \ord($record[0]);
+        if ($b < 0x80) {
+            $headerLen = $b;
+            $p = 1;
+        } else {
+            [$headerLen, $p] = Varint::decode($record, 0);
+        }
         $offsets = [];
         $body = $headerLen;
         $i = 0;
         while ($p < $headerLen) {
-            [$type, $n] = Varint::decode($record, $p);
-            $p += $n;
+            $b = \ord($record[$p]);
+            if ($b < 0x80) {
+                $type = $b;
+                $p++;
+            } else {
+                [$type, $n] = Varint::decode($record, $p);
+                $p += $n;
+            }
             $offsets[$i++] = [$type, $body];
-            $body += self::bodyLength($type);
+            $body += $type >= 12 ? ($type - 12 - ($type & 1)) >> 1 : self::BODY_LEN[$type];
         }
         return $offsets;
     }
@@ -156,18 +287,29 @@ final class RecordCodec
             }
         }
 
-        [$headerLen, $p] = Varint::decode($record, 0);
+        $b = \ord($record[0]);
+        if ($b < 0x80) {
+            $headerLen = $b;
+            $p = 1;
+        } else {
+            [$headerLen, $p] = Varint::decode($record, 0);
+        }
         $body = $headerLen;
         $i = 0;
         $values = [];
         while ($p < $headerLen && $i <= $max) {
-            [$type, $n] = Varint::decode($record, $p);
-            $p += $n;
-            $len = self::bodyLength($type);
-            if (isset($want[$i])) {
-                $values[$i] = self::decodeValue($type, $record, $body)[0];
+            $b = \ord($record[$p]);
+            if ($b < 0x80) {
+                $type = $b;
+                $p++;
+            } else {
+                [$type, $n] = Varint::decode($record, $p);
+                $p += $n;
             }
-            $body += $len;
+            if (isset($want[$i])) {
+                $values[$i] = self::decodeAt($record, $type, $body);
+            }
+            $body += $type >= 12 ? ($type - 12 - ($type & 1)) >> 1 : self::BODY_LEN[$type];
             $i++;
         }
         foreach ($want as $pos => $_) {
@@ -179,110 +321,48 @@ final class RecordCodec
     /** Decode a single value given its serial type and body offset. */
     public static function decodeAt(string $record, int $type, int $bodyOff): null|int|float|string|Blob
     {
-        return self::decodeValue($type, $record, $bodyOff)[0];
-    }
-
-    /** @return array{0:int,1:string} [serialType, bodyBytes] */
-    private static function encodeInt(int $v): array
-    {
-        if ($v === 0) {
-            return [8, ''];
+        if ($type >= 13) {
+            if (($type & 1) === 1) { // TEXT
+                return \substr($record, $bodyOff, ($type - 13) >> 1);
+            }
+            return new Blob(\substr($record, $bodyOff, ($type - 12) >> 1));
         }
-        if ($v === 1) {
-            return [9, ''];
+        switch ($type) {
+            case 0:
+                return null;
+            case 1:
+                $v = \ord($record[$bodyOff]);
+                return $v >= 0x80 ? $v - 0x100 : $v;
+            case 8:
+                return 0;
+            case 9:
+                return 1;
+            case 2:
+                $v = (\ord($record[$bodyOff]) << 8) | \ord($record[$bodyOff + 1]);
+                return $v >= 0x8000 ? $v - 0x10000 : $v;
+            case 3:
+                $v = (\ord($record[$bodyOff]) << 16) | (\ord($record[$bodyOff + 1]) << 8) | \ord($record[$bodyOff + 2]);
+                return $v >= 0x800000 ? $v - 0x1000000 : $v;
+            case 4:
+                /** @var array{1:int} $u */
+                $u = \unpack('N', $record, $bodyOff);
+                $v = $u[1];
+                return $v >= 0x80000000 ? $v - 0x100000000 : $v;
+            case 7:
+                /** @var array{1:float} $u */
+                $u = \unpack('E', $record, $bodyOff);
+                return $u[1];
+            case 6:
+                /** @var array{1:int} $u */
+                $u = \unpack('J', $record, $bodyOff);
+                return $u[1];
+            case 5:
+                /** @var array{1:int} $u */
+                $u = \unpack('N', $record, $bodyOff + 2);
+                $v = (\ord($record[$bodyOff]) << 40) | (\ord($record[$bodyOff + 1]) << 32) | $u[1];
+                return $v >= 0x800000000000 ? $v - 0x1000000000000 : $v;
+            default: // 12 (empty BLOB) — 10/11 are reserved and never produced
+                return $type === 12 ? new Blob('') : null;
         }
-        if ($v >= -128 && $v <= 127) {
-            return [1, \pack('c', $v)];
-        }
-        if ($v >= -32768 && $v <= 32767) {
-            return [2, \substr(\pack('N', $v & 0xFFFF), 2)];
-        }
-        if ($v >= -8388608 && $v <= 8388607) {
-            return [3, \substr(\pack('N', $v & 0xFFFFFF), 1)];
-        }
-        if ($v >= -2147483648 && $v <= 2147483647) {
-            return [4, \pack('N', $v & 0xFFFFFFFF)];
-        }
-        if ($v >= -140737488355328 && $v <= 140737488355327) {
-            // 48-bit: take low 6 bytes of the 64-bit big-endian form.
-            return [5, \substr(self::packI64($v), 2)];
-        }
-        return [6, self::packI64($v)];
-    }
-
-    /** @return array{0:null|int|float|string|Blob,1:int} [value, bytesConsumed] */
-    private static function decodeValue(int $type, string $buf, int $off): array
-    {
-        return match (true) {
-            $type === 0 => [null, 0],
-            $type === 1 => [self::unpackInt($buf, $off, 1), 1],
-            $type === 2 => [self::unpackInt($buf, $off, 2), 2],
-            $type === 3 => [self::unpackInt($buf, $off, 3), 3],
-            $type === 4 => [self::unpackInt($buf, $off, 4), 4],
-            $type === 5 => [self::unpackInt($buf, $off, 6), 6],
-            $type === 6 => [self::unpackInt($buf, $off, 8), 8],
-            $type === 7 => [self::unpackFloat(\substr($buf, $off, 8)), 8],
-            $type === 8 => [0, 0],
-            $type === 9 => [1, 0],
-            ($type & 1) === 0 => [new Blob(\substr($buf, $off, ($type - 12) >> 1)), ($type - 12) >> 1],
-            default => [\substr($buf, $off, ($type - 13) >> 1), ($type - 13) >> 1],
-        };
-    }
-
-    private static function bodyLength(int $type): int
-    {
-        return match (true) {
-            $type === 0, $type === 8, $type === 9 => 0,
-            $type === 1 => 1,
-            $type === 2 => 2,
-            $type === 3 => 3,
-            $type === 4 => 4,
-            $type === 5 => 6,
-            $type === 6, $type === 7 => 8,
-            ($type & 1) === 0 => ($type - 12) >> 1,
-            default => ($type - 13) >> 1,
-        };
-    }
-
-    private static function packI64(int $v): string
-    {
-        // Big-endian two's complement 64-bit.
-        return \pack('J', $v);
-    }
-
-    private static function unpackInt(string $buf, int $off, int $len): int
-    {
-        if ($len === 8) {
-            // Full width: unpack as big-endian 64-bit. PHP's signed int already
-            // carries the two's-complement interpretation we want.
-            /** @var array{1:int} $u */
-            $u = \unpack('J', \substr($buf, $off, 8));
-            return $u[1];
-        }
-
-        $bytes = \substr($buf, $off, $len);
-        $val = 0;
-        for ($i = 0; $i < $len; $i++) {
-            $val = ($val << 8) | \ord($bytes[$i]);
-        }
-        // Sign-extend from the top bit of the stored width.
-        $signBit = 1 << ($len * 8 - 1);
-        if ($val & $signBit) {
-            $val -= 1 << ($len * 8);
-        }
-        return $val;
-    }
-
-    private static function packFloat(float $f): string
-    {
-        // pack 'E' = big-endian IEEE-754 double.
-        return \pack('E', $f);
-    }
-
-    private static function unpackFloat(string $bytes): float
-    {
-        /** @var array{1:float} $u */
-        $u = \unpack('E', $bytes);
-        return $u[1];
     }
 }

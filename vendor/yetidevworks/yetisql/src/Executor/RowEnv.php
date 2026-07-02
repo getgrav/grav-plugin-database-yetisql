@@ -101,14 +101,14 @@ final class RowEnv
      */
     private function frameSkipped(array $frame, ?string $tableLc): bool
     {
-        $aliasOnly = $frame['aliasOnly'] ?? false;
         if ($tableLc === null) {
-            return $aliasOnly;
+            return $frame['aliasOnly'] ?? false;
         }
-        if ($frame['alias'] === $tableLc) {
-            return false;
-        }
-        return $aliasOnly || \strtolower($frame['info']->name) !== $tableLc;
+        // The frame's alias (which defaults to the table name when none was
+        // given) is the ONLY name that qualifies its columns: an explicit alias
+        // replaces the table name, as in SQLite — inside "FROM t AS t2", "t.x"
+        // is not this frame (in a subquery it resolves to an outer scope).
+        return $frame['alias'] !== $tableLc;
     }
 
     /**

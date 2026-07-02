@@ -81,9 +81,36 @@ final class Varint
         return [$result, 9];
     }
 
-    /** Number of bytes the value would occupy when encoded. */
+    /** Number of bytes the value would occupy when encoded (no allocation). */
     public static function size(int $value): int
     {
-        return \strlen(self::encode($value));
+        if ($value < 0) {
+            return 9; // sign bit set: always the 9-byte form
+        }
+        if ($value <= 0x7F) {
+            return 1;
+        }
+        if ($value <= 0x3FFF) {
+            return 2;
+        }
+        if ($value <= 0x1FFFFF) {
+            return 3;
+        }
+        if ($value <= 0xFFFFFFF) {
+            return 4;
+        }
+        if ($value <= 0x7FFFFFFFF) {
+            return 5;
+        }
+        if ($value <= 0x3FFFFFFFFFF) {
+            return 6;
+        }
+        if ($value <= 0x1FFFFFFFFFFFF) {
+            return 7;
+        }
+        if ($value <= 0x7FFFFFFFFFFFFF) {
+            return 8;
+        }
+        return 9;
     }
 }

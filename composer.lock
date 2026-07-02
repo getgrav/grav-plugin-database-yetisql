@@ -8,16 +8,16 @@
     "packages": [
         {
             "name": "yetidevworks/yetisql",
-            "version": "v1.0.0",
+            "version": "v1.0.1",
             "source": {
                 "type": "git",
                 "url": "https://github.com/yetidevworks/YetiSQL.git",
-                "reference": "56e4de1e42d709cac445020319d9861afe3de996"
+                "reference": "fe3e49bdbcf8f253f0a02f81a53d6aea5a2d8ebd"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/yetidevworks/YetiSQL/zipball/56e4de1e42d709cac445020319d9861afe3de996",
-                "reference": "56e4de1e42d709cac445020319d9861afe3de996",
+                "url": "https://api.github.com/repos/yetidevworks/YetiSQL/zipball/fe3e49bdbcf8f253f0a02f81a53d6aea5a2d8ebd",
+                "reference": "fe3e49bdbcf8f253f0a02f81a53d6aea5a2d8ebd",
                 "shasum": ""
             },
             "require": {
@@ -63,9 +63,9 @@
             ],
             "support": {
                 "issues": "https://github.com/yetidevworks/YetiSQL/issues",
-                "source": "https://github.com/yetidevworks/YetiSQL/tree/v1.0.0"
+                "source": "https://github.com/yetidevworks/YetiSQL/tree/v1.0.1"
             },
-            "time": "2026-06-18T20:39:24+00:00"
+            "time": "2026-07-02T06:46:04+00:00"
         }
     ],
     "packages-dev": [],

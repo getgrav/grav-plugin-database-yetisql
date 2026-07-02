@@ -43,13 +43,15 @@ final class TableBTree
     {
         $pageNo = $this->findLeaf($rowid);
         $page = $this->pager->readPage($pageNo);
-        // Leaf cells are sorted by rowid, so binary-search rather than scan.
+        // Leaf cells are sorted by rowid, so binary-search the cached rowids.
+        $rids = $this->leafRowids($page);
         $lo = 0;
-        $hi = \count($page->cells) - 1;
+        $hi = \count($rids) - 1;
         while ($lo <= $hi) {
             $mid = ($lo + $hi) >> 1;
-            [$rid, , $plen, $n1, $n2] = $this->parseLeafCell($page->cells[$mid]);
+            $rid = $rids[$mid];
             if ($rid === $rowid) {
+                [, , $plen, $n1, $n2] = $this->parseLeafCell($page->cells[$mid]);
                 return $this->readPayload($page->cells[$mid], $plen, $n1 + $n2);
             }
             if ($rid < $rowid) {
@@ -59,6 +61,44 @@ final class TableBTree
             }
         }
         return null;
+    }
+
+    /**
+     * Each leaf cell's rowid, aligned with $page->cells, cached on the page so
+     * repeated binary searches decode each cell's header at most once per page
+     * generation.
+     *
+     * @return list<int>
+     */
+    private function leafRowids(BTreePage $page): array
+    {
+        if ($page->keyCache !== null) {
+            return $page->keyCache;
+        }
+        $rids = [];
+        foreach ($page->cells as $cell) {
+            [, $n1] = Varint::decode($cell, 0);
+            $rids[] = Varint::decode($cell, $n1)[0];
+        }
+        return $page->keyCache = $rids;
+    }
+
+    /**
+     * Each interior cell's separator rowid, aligned with $page->cells, cached
+     * on the page (the child pointer is unpacked from the one matched cell).
+     *
+     * @return list<int>
+     */
+    private function interiorSeps(BTreePage $page): array
+    {
+        if ($page->keyCache !== null) {
+            return $page->keyCache;
+        }
+        $seps = [];
+        foreach ($page->cells as $cell) {
+            $seps[] = Varint::decode($cell, 4)[0];
+        }
+        return $page->keyCache = $seps;
     }
 
     public function exists(int $rowid): bool
@@ -76,8 +116,8 @@ final class TableBTree
                 if ($page->cells === []) {
                     return 0;
                 }
-                $last = $page->cells[\count($page->cells) - 1];
-                return $this->parseLeafCell($last)[0];
+                $rids = $this->leafRowids($page);
+                return $rids[\count($rids) - 1];
             }
             $pageNo = $page->rightChild;
         }
@@ -172,8 +212,7 @@ final class TableBTree
     {
         $page = $this->pager->readPage($pageNo);
         if ($page->isLeaf()) {
-            foreach ($page->cells as $cell) {
-                $rid = $this->parseLeafCell($cell)[0];
+            foreach ($this->leafRowids($page) as $rid) {
                 if ($from === null || $rid >= $from) {
                     yield $rid;
                 }
@@ -197,14 +236,14 @@ final class TableBTree
 
         $page = $this->pager->readPage($pageNo);
         if ($page->isLeaf()) {
-            $cells = $page->cells;
-            $n = \count($cells);
+            $rids = $this->leafRowids($page);
+            $n = \count($rids);
             if ($n === 0) {
                 return 0;
             }
 
-            $first = $this->parseLeafCell($cells[0])[0];
-            $last = $this->parseLeafCell($cells[$n - 1])[0];
+            $first = $rids[0];
+            $last = $rids[$n - 1];
             if ($this->rowidInLowerBound($first, $low, $lowInc) && $this->rowidInUpperBound($last, $high, $highInc)) {
                 return $n;
             }
@@ -213,8 +252,7 @@ final class TableBTree
             }
 
             $count = 0;
-            foreach ($cells as $cell) {
-                $rid = $this->parseLeafCell($cell)[0];
+            foreach ($rids as $rid) {
                 if (!$this->rowidInLowerBound($rid, $low, $lowInc)) {
                     continue;
                 }
@@ -261,10 +299,8 @@ final class TableBTree
             return [null, null];
         }
         if ($page->isLeaf()) {
-            return [
-                $this->parseLeafCell($page->cells[0])[0],
-                $this->parseLeafCell($page->cells[\count($page->cells) - 1])[0],
-            ];
+            $rids = $this->leafRowids($page);
+            return [$rids[0], $rids[\count($rids) - 1]];
         }
 
         $firstChild = $this->parseInteriorCell($page->cells[0])[0];
@@ -298,22 +334,13 @@ final class TableBTree
 
     private function childFor(BTreePage $page, int $rowid): int
     {
-        // Interior cells are ordered by separator key; binary-search the first
-        // whose separator is >= the target rowid.
-        $cells = $page->cells;
-        $lo = 0;
-        $hi = \count($cells) - 1;
-        $found = -1;
-        while ($lo <= $hi) {
-            $mid = ($lo + $hi) >> 1;
-            if ($rowid <= $this->parseInteriorCell($cells[$mid])[1]) {
-                $found = $mid;
-                $hi = $mid - 1;
-            } else {
-                $lo = $mid + 1;
-            }
+        $found = $this->childIndexFor($page, $rowid);
+        if ($found === -1) {
+            return $page->rightChild;
         }
-        return $found === -1 ? $page->rightChild : $this->parseInteriorCell($cells[$found])[0];
+        /** @var array{1:int} $c */
+        $c = \unpack('N', \substr($page->cells[$found], 0, 4));
+        return $c[1];
     }
 
     /**
@@ -451,16 +478,29 @@ final class TableBTree
     {
         $page = $this->pager->readPage($pageNo);
         if ($page->isLeaf()) {
-            foreach ($page->cells as $i => $cell) {
-                [$rid, , $plen, $n1, $n2] = $this->parseLeafCell($cell);
+            $rids = $this->leafRowids($page);
+            $lo = 0;
+            $hi = \count($rids) - 1;
+            while ($lo <= $hi) {
+                $mid = ($lo + $hi) >> 1;
+                $rid = $rids[$mid];
                 if ($rid === $rowid) {
+                    $cell = $page->cells[$mid];
+                    [, , $plen, $n1, $n2] = $this->parseLeafCell($cell);
                     if ($plen > BTreePage::maxLocal($this->pager->pageSize())) {
                         $this->freeOverflow($cell, $n1 + $n2);
                     }
-                    $page->removeCell($i);
+                    $page->removeCell($mid);
+                    \array_splice($rids, $mid, 1);
+                    $page->keyCache = $rids;
                     $this->refreshSubtreeCount($page);
                     $this->pager->writePage($pageNo, $page);
                     return true;
+                }
+                if ($rid < $rowid) {
+                    $lo = $mid + 1;
+                } else {
+                    $hi = $mid - 1;
                 }
             }
             return false;
@@ -555,15 +595,15 @@ final class TableBTree
 
     private function childIndexFor(BTreePage $page, int $rowid): int
     {
-        // First interior cell whose separator is >= rowid (binary search), or -1
-        // for the right-most child.
-        $cells = $page->cells;
+        // First interior cell whose separator is >= rowid (binary search over
+        // the page's cached separators), or -1 for the right-most child.
+        $seps = $this->interiorSeps($page);
         $lo = 0;
-        $hi = \count($cells) - 1;
+        $hi = \count($seps) - 1;
         $found = -1;
         while ($lo <= $hi) {
             $mid = ($lo + $hi) >> 1;
-            if ($rowid <= $this->parseInteriorCell($cells[$mid])[1]) {
+            if ($rowid <= $seps[$mid]) {
                 $found = $mid;
                 $hi = $mid - 1;
             } else {
@@ -576,12 +616,12 @@ final class TableBTree
     /** Whether $rowid is present in this leaf (binary search, no payload read). */
     private function leafHas(BTreePage $page, int $rowid): bool
     {
-        $cells = $page->cells;
+        $rids = $this->leafRowids($page);
         $lo = 0;
-        $hi = \count($cells) - 1;
+        $hi = \count($rids) - 1;
         while ($lo <= $hi) {
             $mid = ($lo + $hi) >> 1;
-            $rid = $this->parseLeafCell($cells[$mid])[0];
+            $rid = $rids[$mid];
             if ($rid === $rowid) {
                 return true;
             }
@@ -599,30 +639,38 @@ final class TableBTree
         $n = \count($page->cells);
         if ($n === 0) {
             $page->appendCell($cell);
+            $page->keyCache = [$rowid];
             return true;
         }
 
         // Cells are kept sorted by rowid. Bulk loads insert in ascending order,
         // so check the tail first: an append is the overwhelmingly common case
         // and avoids scanning the whole page (which made bulk insert O(n^2)).
-        $lastRid = $this->parseLeafCell($page->cells[$n - 1])[0];
+        // The mutators reset the page's key cache, so re-apply the (known)
+        // updated rowid list afterwards to keep later probes decode-free.
+        $rids = $this->leafRowids($page);
+        $lastRid = $rids[$n - 1];
         if ($rowid > $lastRid) {
             $page->appendCell($cell);
+            $rids[] = $rowid;
+            $page->keyCache = $rids;
             return true;
         }
         if ($rowid === $lastRid) {
             $page->replaceCell($n - 1, $cell);
+            $page->keyCache = $rids;
             return false;
         }
 
-        // Otherwise binary-search the insertion point (O(log n) cell parses).
+        // Otherwise binary-search the insertion point.
         $lo = 0;
         $hi = $n - 1;
         while ($lo < $hi) {
             $mid = ($lo + $hi) >> 1;
-            $rid = $this->parseLeafCell($page->cells[$mid])[0];
+            $rid = $rids[$mid];
             if ($rid === $rowid) {
                 $page->replaceCell($mid, $cell); // replace
+                $page->keyCache = $rids;
                 return false;
             }
             if ($rid < $rowid) {
@@ -631,8 +679,15 @@ final class TableBTree
                 $hi = $mid;
             }
         }
-        // $lo is the first cell with rowid >= $rowid (and != since tail handled).
+        if ($rids[$lo] === $rowid) {
+            $page->replaceCell($lo, $cell);
+            $page->keyCache = $rids;
+            return false;
+        }
+        // $lo is the first cell with rowid > $rowid.
         $page->insertCell($lo, $cell);
+        \array_splice($rids, $lo, 0, [$rowid]);
+        $page->keyCache = $rids;
         return true;
     }
 

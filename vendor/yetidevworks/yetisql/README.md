@@ -190,7 +190,7 @@ Two durability modes are available:
   prefix and discards any half-written trailing transaction. `PRAGMA wal_checkpoint` (and
   closing the database) folds the log back into the main file. WAL turns each commit's two
   fsyncs + journal churn into a single sequential append + fsync, so many small commits get
-  **~2.4× faster** (see *Performance*).
+  **~3–4× faster** (see *Performance*).
 
 ## Performance
 
@@ -201,14 +201,14 @@ index-based planning buys. Representative run (in-memory, 5000 rows, PHP 8.3):
 ```
 workload                           SQLite  YetiSQL+idx  YetiSQL scan  vs SQLite
 ------------------------------------------------------------------------------
-bulk insert                        3.1 ms    127.9 ms     129.7 ms         42x
-PK lookups (×2000)                 1.4 ms     49.4 ms      45.3 ms         34x
-city COUNT (×200, ~20% rows)       2.9 ms      8.9 ms      85.6 ms          3x
-range query (×200)                 1.8 ms      4.2 ms      19.8 ms          2x
-group-by aggregate (×50)          31.3 ms     25.1 ms      26.4 ms          1x
-PK updates (×1000)                 0.6 ms     41.5 ms      36.9 ms         68x
-join users⋈posts (×3, ≤100)        0.0 ms     50.5 ms      42.1 ms      ~1300x
-correlated subquery (≤100)         0.0 ms     12.7 ms      14.7 ms       ~320x
+bulk insert                        2.3 ms     25.8 ms      25.9 ms         11x
+PK lookups (×2000)                 0.9 ms      9.3 ms       9.9 ms         10x
+city COUNT (×200, ~20% rows)       2.9 ms      2.9 ms      15.0 ms          1x
+range query (×200)                 1.9 ms      1.5 ms       3.9 ms          1x
+group-by aggregate (×50)          31.3 ms      5.4 ms       5.3 ms         0.2x
+PK updates (×1000)                 0.4 ms      6.9 ms       6.5 ms         16x
+join users⋈posts (×3, ≤100)        0.0 ms      3.0 ms       8.4 ms       ~100x
+correlated subquery (≤100)         0.0 ms      0.8 ms       3.0 ms        ~30x
 ```
 
 (The join and correlated-subquery ratios are dominated by SQLite rounding to ~0 ms at
@@ -218,29 +218,35 @@ this scale; treat them as "fast enough to be noise on the C engine," not a liter
 php benchmarks/bench.php [rows]    # default 5000
 ```
 
+(One measurement gotcha: a loaded xdebug in `debug`/`develop` mode inflates
+YetiSQL's side of this benchmark roughly 3× while barely touching the C engine.
+If your numbers look far worse than the table, check `php -v` for xdebug and
+re-run with `-dxdebug.mode=off`.)
+
 Takeaways:
 - **Index planning is the headline.** The `YetiSQL+idx` vs `YetiSQL scan` gap is
-  what persistent indexes buy: selective `COUNT` is ~10×, range queries ~5×,
-  and index-accelerated correlated subqueries stay a little faster than the
+  what persistent indexes buy: selective `COUNT` is ~5×, range queries ~2.5×,
+  and index-accelerated correlated subqueries stay faster than the
   no-index count-map path. Equality joins without a persistent index can still
   use a transient hash table, and unindexed equality `COUNT(*)` correlated
   subqueries can build a transient count map, so both avoid the old
   full-inner-scan-per-outer-row cost. Covered `COUNT(*)` over full tables,
   rowid ranges, and leading-column index predicates count B-tree cells directly
   without fetching rows, and `UPDATE` only re-indexes columns that change.
-- **For indexed, set-oriented work YetiSQL is competitive with SQLite** in this
-  in-memory harness — the group-by aggregate and indexed COUNT/range rows are
-  within single-digit multiples (sometimes faster, since there's no driver/IPC
-  boundary). Point operations, inserts, and updates stay tens of ×'s behind: the
-  irreducible cost of a tree-walking interpreter in pure PHP.
+- **For indexed, set-oriented work YetiSQL matches or beats SQLite** in this
+  in-memory harness — indexed COUNT and range queries land at parity, and the
+  group-by aggregate is ~6× *faster* (covered counts and the compiled per-row
+  loop never leave the process). Point operations, inserts, and updates stay
+  an order of magnitude behind: the irreducible per-row cost of an interpreter
+  in pure PHP against C.
 
 **Durability — WAL vs rollback journal** (file-backed, 2000 single-statement commits):
 
 ```
 workload                                 rollback            WAL   speedup
 ------------------------------------------------------------------------------
-INSERTs, one commit each                 501.6 ms       208.2 ms      2.4x
-UPDATEs, one commit each                 488.0 ms       203.5 ms      2.4x
+INSERTs, one commit each                 565.3 ms       143.9 ms      3.9x
+UPDATEs, one commit each                 410.5 ms       122.7 ms      3.3x
 ```
 
 WAL replaces two fsyncs + journal create/delete per commit with one fsync and a
@@ -248,21 +254,21 @@ sequential append, so the win scales with the number of commits (a single big
 transaction commits once and sees no difference; in-memory never touches disk).
 
 **vs MySQL / MariaDB** (`benchmarks/bench_mysql.php`, both durable: YetiSQL
-file-backed with a rollback journal, MariaDB 12.2 over the local socket with
+file-backed with a rollback journal, MariaDB 12.3 over the local socket with
 InnoDB's default per-commit fsync; 5000 rows, PHP 8.3):
 
 ```
 workload                          MariaDB  YetiSQL(file)  Yeti/MySQL
 ------------------------------------------------------------------------------
-bulk insert (1 txn)               94.2 ms       124.8 ms        1.3x
-create 3 indexes                 149.6 ms       232.8 ms        1.6x
-PK lookups (×2000)                38.8 ms        52.0 ms        1.3x
-city COUNT (×200, ~20% rows)      18.1 ms        12.3 ms        0.7x
-range query (×200)                13.7 ms         5.2 ms        0.4x
-group-by aggregate (×50)          52.9 ms        24.9 ms        0.5x
-PK updates (×1000, 1 txn)         16.7 ms        43.3 ms        2.6x
-join users⋈posts (×3, ≤100)       0.3 ms        12.7 ms       38.5x
-correlated subquery (≤100)         0.1 ms         2.3 ms       18.1x
+bulk insert (1 txn)               61.2 ms        25.9 ms        0.4x
+create 3 indexes                 164.7 ms        19.6 ms        0.1x
+PK lookups (×2000)                41.6 ms        12.0 ms        0.3x
+city COUNT (×200, ~20% rows)      20.4 ms         3.0 ms        0.1x
+range query (×200)                13.3 ms         1.7 ms        0.1x
+group-by aggregate (×50)          52.5 ms         5.4 ms        0.1x
+PK updates (×1000, 1 txn)         16.1 ms         7.3 ms        0.5x
+join users⋈posts (×3, ≤100)       1.4 ms         2.7 ms        2.0x
+correlated subquery (≤100)         0.1 ms         0.8 ms        5.8x
 ```
 
 ```bash
@@ -272,23 +278,27 @@ php benchmarks/bench_mysql.php [rows]    # default 5000
 This is apples-to-oranges by design, and that's the point: YetiSQL runs
 **in-process** while MariaDB is a **client-server** engine, so every statement
 crosses a socket to a separate process. That round-trip is exactly what an
-embedded database exists to avoid, so for repeated scans and aggregates YetiSQL
-is *faster* here (`Yeti/MySQL < 1`) despite being pure PHP — those columns fire
-hundreds of separate queries and MariaDB pays IPC on each, while YetiSQL's
-covered counts answer them without leaving the process. Bulk insert and point
-lookups land close (~1.3×). The real gaps are per-row `UPDATE` (~2.6×) and tiny
-joins / correlated subqueries — but those are 0.1–0.3 ms on MariaDB, so the
-large *ratio* is sub-millisecond *absolute* time. The takeaway isn't "faster
-than MySQL"; it's that a zero-dependency pure-PHP engine stays in the same league
-on real workloads where avoiding the client-server boundary counts.
+embedded database exists to avoid, and it shows: YetiSQL wins seven of the nine
+workloads here (`Yeti/MySQL < 1`) despite being pure PHP — bulk insert, point
+lookups, per-row updates, index builds, and every scan/aggregate column, where
+MariaDB pays IPC on each of hundreds of statements while YetiSQL's covered
+counts never leave the process. The remaining gaps are the tiny join and
+correlated-subquery rows, which are ~0.1–1.4 ms on MariaDB — the large *ratio*
+is sub-millisecond *absolute* time. The takeaway isn't "faster than MySQL"; it's
+that for the workloads where an app would reach for an embedded database in the
+first place, a zero-dependency pure-PHP engine is a genuine alternative.
 
 Hot-path optimisations already in place: an LRU page cache, a parsed-page cache
-(so repeated reads skip re-decoding), single-pass page encoding, binary-search
-rowid lookups, lazy/early-stop index scans, multi-column index prefix seeks,
-index-driven joins and correlated subqueries, covered table/index counts, and a
+(so repeated reads skip re-decoding), per-page decoded-key caches (binary
+searches and scans never re-decode cell bytes), an allocation-free record codec,
+single-pass page encoding, binary-search rowid lookups, lazy row decoding
+(columns materialize on first access), lazy/early-stop index scans, multi-column
+index prefix seeks, bulk bottom-up index builds sorted via packed `memcmp` keys,
+index-driven joins and correlated subqueries, covered table/index counts, a
 transient hash table for unindexed equality joins, transient count maps for
-unindexed equality `COUNT(*)` correlated subqueries, plus a compiled-closure
-plan cache for the per-row hot loop.
+unindexed equality `COUNT(*)` correlated subqueries, plus compiled-closure and
+memoized access-plan caches so re-executed prepared statements skip
+re-planning entirely.
 
 ### VDBE & EXPLAIN
 

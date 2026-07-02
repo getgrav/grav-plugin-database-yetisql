@@ -1,7 +1,7 @@
 name: Database YetiSQL
 slug: database-yetisql
 type: plugin
-version: 1.0.0
+version: 1.0.1
 description: Adds the pure-PHP YetiSQL engine as a connection type for the Database plugin
 icon: database
 author:

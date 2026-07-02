@@ -4,6 +4,42 @@ All notable changes to YetiSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-07-02
+
+### Fixed
+
+- **Alias-qualified column resolution.** An explicit table alias now replaces the
+  table name for qualification, matching SQLite: inside `FROM t AS t2`, `t.col` no
+  longer binds to the aliased table — in a subquery it resolves to the outer
+  scope, and otherwise it is an error, exactly as SQLite behaves. Previously a
+  correlated `WHERE t2.age = t.age` compared each row to itself, so per-value
+  counts silently returned the full-table count. Applied consistently across the
+  evaluator, the query planner, compiled expressions, `t.*` expansion, and the
+  VDBE compiler.
+
+### Changed
+
+- **Performance: the benchmark suite runs in less than half the time** (5k-row
+  suite 353ms → 150ms; PK lookups −43%, PK deletes −77%, CREATE INDEX −53%, PK
+  updates −25%, joins −22%, aggregates −23%, bulk insert −20%), from five changes:
+  - B-tree pages cache their decoded cell keys (rowids / index key records), so
+    binary searches and scans stop re-decoding cell bytes on every probe; leaf
+    inserts and deletes maintain the cache in place.
+  - `RecordCodec` rewritten as flat inline loops — single-byte varint fast paths,
+    `ord()` arithmetic for narrow integers, offset-based `unpack`, and no
+    intermediate tuple allocations. Encoding is byte-identical to the previous
+    codec (verified by a 100k-trial differential fuzz); decoding is ~3× faster.
+  - `CREATE INDEX` sorts its keys via packed order-preserving byte strings
+    compared with `memcmp` instead of a userland comparator, falling back to the
+    comparator for values the packing cannot order exactly (integers beyond 2^53,
+    NaN). Verified against the comparator by a 200k-trial fuzz.
+  - Prepared single-`col = const` probes memoize their access plan per statement
+    (validated against the schema cookie), so re-executions skip re-planning;
+    plain-table `FROM` resolution is memoized the same way. NULL bindings and
+    schema changes fall back to full planning.
+  - `Schema::resolvedIndexes` is memoized per table, and `Varint::size` is
+    computed arithmetically instead of measuring a throwaway encode.
+
 ## [1.0.0] - 2026-06-18
 
 First tagged release.

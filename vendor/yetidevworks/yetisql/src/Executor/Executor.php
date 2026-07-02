@@ -81,6 +81,21 @@ final class Executor
     private \WeakMap $generatedColumnPlans;
     /** @var \WeakMap<TableInfo,array{cookie:int,plans:list<array{childPositions:list<int>,parent:TableInfo,refPositions:list<int>,index:?IndexInfo}>}> */
     private \WeakMap $fkChildCheckPlans;
+    /**
+     * Memoized single-`col = const` plan shapes, keyed by the WHERE Expr object
+     * and validated against schema cookie + table + alias (see bestPlan).
+     *
+     * @var \WeakMap<Expr,array{cookie:int,table:string,alias:?string,kind:string,pos:int,const:Expr,index:?IndexInfo}>
+     */
+    private \WeakMap $eqPlanShapes;
+    /**
+     * Memoized plain-table FROM resolutions, keyed by the TableRef object and
+     * validated against the schema cookie (views/CTE shadowing are checked
+     * before consulting this; any DDL bumps the cookie).
+     *
+     * @var \WeakMap<\YetiDevWorks\YetiSQL\Sql\Ast\TableRef,array{cookie:int,src:array<string,mixed>}>
+     */
+    private \WeakMap $sourceRefCache;
 
     /**
      * Common table expressions visible to the statement currently executing,
@@ -105,6 +120,8 @@ final class Executor
         $this->selectSignatures = new \WeakMap();
         $this->generatedColumnPlans = new \WeakMap();
         $this->fkChildCheckPlans = new \WeakMap();
+        $this->eqPlanShapes = new \WeakMap();
+        $this->sourceRefCache = new \WeakMap();
     }
 
     /**
@@ -992,13 +1009,23 @@ final class Executor
         if ($ref->name !== null && isset($this->cteScope[\strtolower($ref->name)])) {
             return $this->resolveCteSource($ref, $eval);
         }
+        // Plain table (or view): re-resolving per execution is repeat work, and
+        // anything that could change the answer — a view or table appearing or
+        // going away — bumps the schema cookie.
+        $cookie = $this->db->pager()->schemaCookie();
+        $cached = $this->sourceRefCache[$ref] ?? null;
+        if ($cached !== null && $cached['cookie'] === $cookie) {
+            return $cached['src'];
+        }
         if ($ref->name !== null) {
             $view = $this->db->schema()->getView($ref->name);
             if ($view !== null) {
                 return $this->resolveViewSource($ref, $view, $eval);
             }
         }
-        return $this->resolveSource($ref);
+        $src = $this->resolveSource($ref);
+        $this->sourceRefCache[$ref] = ['cookie' => $cookie, 'src' => $src];
+        return $src;
     }
 
     private function flattenSimpleSourceSelect(SelectStatement $select): ?SelectStatement
@@ -1555,8 +1582,10 @@ final class Executor
     /** @param list<array{0:string,1:TableInfo}> $tables */
     private function lookupTableByAlias(array $tables, string $alias): TableInfo
     {
+        // Each source's alias (defaulting to its table name) is the ONLY name
+        // that qualifies it: an explicit alias replaces the table name (SQLite).
         foreach ($tables as [$a, $info]) {
-            if (\strcasecmp($a, $alias) === 0 || \strcasecmp($info->name, $alias) === 0) {
+            if (\strcasecmp($a, $alias) === 0) {
                 return $info;
             }
         }
@@ -3798,7 +3827,64 @@ final class Executor
      *
      * @return array<string,mixed>|null
      */
+    /**
+     * bestPlan with a per-WHERE-expression shape memo. Planning re-evaluates the
+     * constant side and re-consults the index catalog on every execution, which
+     * for a prepared `col = ?` probe (the overwhelmingly common case) is pure
+     * repeat work. The first execution runs the full planner; when the WHERE is
+     * a single `col = const` conjunct that produced a covering rowid/index
+     * equality plan, its parameter-independent shape (column, index, the const
+     * Expr) is memoized against the Expr object and later executions just
+     * re-evaluate the constant. A NULL value or a non-integral rowid probe
+     * returns no plan, exactly as the full planner would; any schema change
+     * (cookie) or table/alias mismatch falls back to full planning.
+     */
     private function bestPlan(Expr $where, ?string $alias, TableInfo $info, Evaluator $eval): ?array
+    {
+        $shape = $this->eqPlanShapes[$where] ?? null;
+        if ($shape !== null
+            && $shape['cookie'] === $this->db->pager()->schemaCookie()
+            && $shape['table'] === $info->name
+            && $shape['alias'] === $alias) {
+            $value = $this->affine($info, $shape['pos'], $this->constValue($shape['const'], $eval));
+            if ($value === null) {
+                return null; // `col = NULL` is never true; the scan+filter yields nothing
+            }
+            if ($shape['kind'] === 'rowid_eq') {
+                if (\is_int($value) || (\is_float($value) && (float) (int) $value === $value)) {
+                    return ['kind' => 'rowid_eq', 'pos' => $shape['pos'], 'values' => [$value], 'coveredAll' => true];
+                }
+                return null; // non-integral rowid probe: the full planner declines it too
+            }
+            return ['kind' => 'index_eq', 'pos' => $shape['pos'], 'index' => $shape['index'], 'values' => [$value], 'coveredAll' => true];
+        }
+
+        $plan = $this->computeBestPlan($where, $alias, $info, $eval);
+
+        if ($where->kind === Expr::BIN && $where->op === '='
+            && $plan !== null
+            && ($plan['coveredAll'] ?? false)
+            && ($plan['kind'] === 'rowid_eq' || $plan['kind'] === 'index_eq')
+            && \count($plan['values'] ?? []) === 1) {
+            [$pos, $const] = $this->colConst($where->left, $where->right, $alias, $info, $eval);
+            // Only a pure literal/param constant is context-free enough to
+            // memoize; outer-column "constants" depend on the enclosing row.
+            if ($pos !== null && $pos === $plan['pos'] && $const !== null && $this->isConstExpr($const)) {
+                $this->eqPlanShapes[$where] = [
+                    'cookie' => $this->db->pager()->schemaCookie(),
+                    'table' => $info->name,
+                    'alias' => $alias,
+                    'kind' => $plan['kind'],
+                    'pos' => $pos,
+                    'const' => $const,
+                    'index' => $plan['index'] ?? null,
+                ];
+            }
+        }
+        return $plan;
+    }
+
+    private function computeBestPlan(Expr $where, ?string $alias, TableInfo $info, Evaluator $eval): ?array
     {
         $indexes = $this->db->schema()->resolvedIndexes($info->name);
         $conjuncts = $this->splitAnd($where);
@@ -4476,9 +4562,16 @@ final class Executor
         if ($e->kind !== Expr::COL) {
             return null;
         }
-        if ($e->table !== null && $alias !== null
-            && \strcasecmp($e->table, $alias) !== 0 && \strcasecmp($e->table, $info->name) !== 0) {
-            return null;
+        // An explicit alias REPLACES the table name for qualification (SQLite:
+        // "t.col" is not this table inside "FROM t AS t2" — in a subquery it
+        // refers to an outer scope instead).
+        if ($e->table !== null) {
+            $matches = $alias !== null
+                ? \strcasecmp($e->table, $alias) === 0
+                : \strcasecmp($e->table, $info->name) === 0;
+            if (!$matches) {
+                return null;
+            }
         }
         $lname = \strtolower((string) $e->name);
         if (\in_array($lname, ['rowid', '_rowid_', 'oid'], true) && $info->columnPos((string) $e->name) === null) {
@@ -6075,9 +6168,9 @@ final class Executor
             }
             $keys[] = $this->indexKey($index, $logical, $rowid);
         }
-        \usort($keys, fn (array $a, array $b): int => $this->compareIndexKeys($a, $b, $index->collations));
+        $this->sortIndexKeys($keys, $index->collations);
         // Bulk bottom-up build from the sorted keys: one linear pass instead of
-        // a per-key descent+split (compareIndexKeys matches IndexBTree's own key
+        // a per-key descent+split (the sort order matches IndexBTree's own key
         // order, so the input is already in the order bulkLoad expects).
         $idx->bulkLoad($keys);
     }
@@ -6404,6 +6497,89 @@ final class Executor
         }
         $this->createIndexFromStatement($stmt, $info);
         return Result::affected(0);
+    }
+
+    /**
+     * Sort index key records into compareIndexKeys() order. Each record is
+     * packed once into an order-preserving byte string so array_multisort can
+     * compare with plain memcmp — n packings instead of n·log n comparator
+     * invocations (each of which is three PHP call frames per column). Values
+     * a packed key cannot order exactly (integers beyond 2^53, NaN) fall back
+     * to the comparator-based sort.
+     *
+     * @param list<array<int,null|int|float|string|Blob>> $keys
+     * @param list<string> $collations
+     */
+    private function sortIndexKeys(array &$keys, array $collations): void
+    {
+        if (\count($keys) < 2) {
+            return;
+        }
+        $packed = [];
+        foreach ($keys as $key) {
+            $sk = $this->packSortKey($key, $collations);
+            if ($sk === null) {
+                \usort($keys, fn (array $a, array $b): int => $this->compareIndexKeys($a, $b, $collations));
+                return;
+            }
+            $packed[] = $sk;
+        }
+        \array_multisort($packed, SORT_ASC, SORT_STRING, $keys);
+    }
+
+    /**
+     * Pack a key record into a byte string whose memcmp order equals
+     * compareIndexKeys() order, or null when the record contains a value the
+     * encoding cannot order exactly. Per component: a storage-class prefix
+     * byte (NULL 0x00 < numeric 0x01 < text 0x02 < blob 0x03) mirrors
+     * Value::compare's class ordering; numerics are the IEEE-754 double bits
+     * with the usual sign-flip transform (fixed 9 bytes); text (after its
+     * collation's fold) and blob bytes are 0x00-escaped and 0x00 0x00
+     * terminated so component boundaries never misorder.
+     *
+     * @param array<int,null|int|float|string|Blob> $key
+     * @param list<string> $collations
+     */
+    private function packSortKey(array $key, array $collations): ?string
+    {
+        $out = '';
+        foreach ($key as $i => $v) {
+            if ($v === null) {
+                $out .= "\x00";
+                continue;
+            }
+            if (\is_int($v) || \is_float($v)) {
+                if (\is_int($v)) {
+                    if ($v > 9007199254740992 || $v < -9007199254740992) {
+                        return null; // beyond 2^53: double bits can't order exactly
+                    }
+                    $f = (float) $v;
+                } else {
+                    if (\is_nan($v)) {
+                        return null;
+                    }
+                    $f = $v == 0.0 ? 0.0 : $v; // fold -0.0 onto +0.0 (they compare equal)
+                }
+                $bits = \unpack('J', \pack('E', $f))[1];
+                // Sign-flip transform: negatives get all bits inverted (reversing
+                // their magnitude order), non-negatives get the sign bit set, so
+                // unsigned byte order equals numeric order.
+                $bits = $bits < 0 ? ~$bits : $bits | PHP_INT_MIN;
+                $out .= "\x01" . \pack('J', $bits);
+                continue;
+            }
+            if ($v instanceof Blob) {
+                $out .= "\x03" . \str_replace("\x00", "\x00\x01", $v->bytes) . "\x00\x00";
+                continue;
+            }
+            $s = match (\strtoupper($collations[$i] ?? 'BINARY')) {
+                'NOCASE' => \strtr($v, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),
+                'RTRIM' => \rtrim($v, ' '),
+                default => $v,
+            };
+            $out .= "\x02" . \str_replace("\x00", "\x00\x01", $s) . "\x00\x00";
+        }
+        return $out;
     }
 
     /** @param list<string> $collations */

@@ -133,14 +133,60 @@ final class IndexBTree
     {
         $pageNo = $this->findLeaf($key);
         $page = $this->pager->readPage($pageNo);
-        foreach ($page->cells as $i => $cell) {
-            if ($this->compareKeys($this->cellKey($cell), $key) === 0) {
+        $keys = $this->leafKeys($page);
+        foreach ($keys as $i => $candidate) {
+            if ($this->compareKeys($candidate, $key) === 0) {
                 $page->removeCell($i);
+                \array_splice($keys, $i, 1);
+                $page->keyCache = $keys;
                 $this->pager->writePage($pageNo, $page);
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Each leaf cell's decoded key record, aligned with $page->cells, cached
+     * on the page so repeated searches skip re-decoding cell payloads.
+     *
+     * @return list<array<int,null|int|float|string|Blob>>
+     */
+    private function leafKeys(BTreePage $page): array
+    {
+        if ($page->keyCache !== null) {
+            return $page->keyCache;
+        }
+        $keys = [];
+        foreach ($page->cells as $cell) {
+            $keys[] = $this->cellKey($cell);
+        }
+        return $page->keyCache = $keys;
+    }
+
+    /**
+     * Each interior cell's decoded separator key record, aligned with
+     * $page->cells (the child pointer is unpacked from the matched cell).
+     *
+     * @return list<array<int,null|int|float|string|Blob>>
+     */
+    private function interiorSepKeys(BTreePage $page): array
+    {
+        if ($page->keyCache !== null) {
+            return $page->keyCache;
+        }
+        $keys = [];
+        foreach ($page->cells as $cell) {
+            $keys[] = RecordCodec::decode($this->readPayload($cell, 4));
+        }
+        return $page->keyCache = $keys;
+    }
+
+    private function cellChild(string $cell): int
+    {
+        /** @var array{1:int} $c */
+        $c = \unpack('N', \substr($cell, 0, 4));
+        return $c[1];
     }
 
     /**
@@ -201,8 +247,7 @@ final class IndexBTree
         $page = $this->pager->readPage($pageNo);
 
         if ($page->isLeaf()) {
-            foreach ($page->cells as $cell) {
-                $key = $this->cellKey($cell);
+            foreach ($this->leafKeys($page) as $key) {
                 if ($lowKey === null || $this->compareKeys($key, $lowKey) >= 0) {
                     yield $key;
                 }
@@ -210,13 +255,13 @@ final class IndexBTree
             return;
         }
 
-        foreach ($page->cells as $cell) {
-            [$child, $sep] = $this->parseInteriorCell($cell);
+        $cells = $page->cells; // snapshot: the consumer may interleave DML
+        foreach ($this->interiorSepKeys($page) as $i => $sep) {
             // Skip subtrees entirely below the low bound.
             if ($lowKey !== null && $this->compareKeys($sep, $lowKey) < 0) {
                 continue;
             }
-            yield from $this->scanPageFrom($child, $lowKey);
+            yield from $this->scanPageFrom($this->cellChild($cells[$i]), $lowKey);
             $lowKey = null; // everything after the first qualifying subtree is in range
         }
         yield from $this->scanPageFrom($page->rightChild, $lowKey);
@@ -245,28 +290,27 @@ final class IndexBTree
         $page = $this->pager->readPage($pageNo);
 
         if ($page->isLeaf()) {
-            $cells = $page->cells;
+            $keys = $this->leafKeys($page);
             $lo = 0;
-            $hi = \count($cells) - 1;
+            $hi = \count($keys) - 1;
             $found = -1;
             while ($lo <= $hi) {
                 $mid = ($lo + $hi) >> 1;
-                if ($this->compareKeys($this->cellKey($cells[$mid]), $lowKey) >= 0) {
+                if ($this->compareKeys($keys[$mid], $lowKey) >= 0) {
                     $found = $mid;
                     $hi = $mid - 1;
                 } else {
                     $lo = $mid + 1;
                 }
             }
-            return $found === -1 ? null : $this->cellKey($cells[$found]);
+            return $found === -1 ? null : $keys[$found];
         }
 
-        foreach ($page->cells as $cell) {
-            [$child, $sep] = $this->parseInteriorCell($cell);
+        foreach ($this->interiorSepKeys($page) as $i => $sep) {
             if ($this->compareKeys($sep, $lowKey) < 0) {
                 continue;
             }
-            $found = $this->firstFromPage($child, $lowKey);
+            $found = $this->firstFromPage($this->cellChild($page->cells[$i]), $lowKey);
             if ($found !== null) {
                 return $found;
             }
@@ -285,6 +329,12 @@ final class IndexBTree
         $page = $this->pager->readPage($pageNo);
         $count = 0;
 
+        // Counting needs only each key's leading column. Reuse the page's key
+        // cache when another path already built it, but don't build one here —
+        // decoding full key records for a count would cost more than the
+        // leading-column-only decode this path otherwise does.
+        $keys = $page->keyCache;
+
         if ($page->isLeaf()) {
             $cells = $page->cells;
             $n = \count($cells);
@@ -292,8 +342,8 @@ final class IndexBTree
                 return 0;
             }
 
-            $first = $this->cellLeading($cells[0], 0);
-            $last = $this->cellLeading($cells[$n - 1], 0);
+            $first = $keys !== null ? ($keys[0][0] ?? null) : $this->cellLeading($cells[0], 0);
+            $last = $keys !== null ? ($keys[$n - 1][0] ?? null) : $this->cellLeading($cells[$n - 1], 0);
             if ($this->leadingInLowerBound($first, $low, $lowInc, $collation)
                 && $this->leadingInUpperBound($last, $high, $highInc, $collation)) {
                 return $n;
@@ -303,8 +353,8 @@ final class IndexBTree
                 return 0;
             }
 
-            foreach ($page->cells as $cell) {
-                $leading = $this->cellLeading($cell, 0);
+            for ($i = 0; $i < $n; $i++) {
+                $leading = $keys !== null ? ($keys[$i][0] ?? null) : $this->cellLeading($cells[$i], 0);
                 if ($low !== null) {
                     $cmp = Value::compare($leading, $low, $collation);
                     if ($cmp < 0 || ($cmp === 0 && !$lowInc)) {
@@ -322,15 +372,15 @@ final class IndexBTree
             return $count;
         }
 
-        foreach ($page->cells as $cell) {
-            [$child, $sep] = $this->parseInteriorCellLeading($cell);
+        foreach ($page->cells as $i => $cell) {
+            $sep = $keys !== null ? ($keys[$i][0] ?? null) : $this->cellLeading($cell, 4);
             if ($low !== null) {
                 $cmp = Value::compare($sep, $low, $collation);
                 if ($cmp < 0 || ($cmp === 0 && !$lowInc)) {
                     continue;
                 }
             }
-            $count += $this->countLeadingPage($child, $low, $lowInc, $high, $highInc, $collation);
+            $count += $this->countLeadingPage($this->cellChild($cell), $low, $lowInc, $high, $highInc, $collation);
             if ($high !== null) {
                 $cmp = Value::compare($sep, $high, $collation);
                 if ($cmp > 0 || ($cmp === 0 && !$highInc)) {
@@ -382,22 +432,8 @@ final class IndexBTree
 
     private function childFor(BTreePage $page, array $key): int
     {
-        // Separators are ordered; binary-search the first cell whose separator
-        // is >= the search key.
-        $cells = $page->cells;
-        $lo = 0;
-        $hi = \count($cells) - 1;
-        $found = -1;
-        while ($lo <= $hi) {
-            $mid = ($lo + $hi) >> 1;
-            if ($this->compareKeys($key, $this->parseInteriorCell($cells[$mid])[1]) <= 0) {
-                $found = $mid;
-                $hi = $mid - 1;
-            } else {
-                $lo = $mid + 1;
-            }
-        }
-        return $found === -1 ? $page->rightChild : $this->parseInteriorCell($cells[$found])[0];
+        $found = $this->childIndexFor($page, $key);
+        return $found === -1 ? $page->rightChild : $this->cellChild($page->cells[$found]);
     }
 
     /** @return array{0:array<int,mixed>,1:int}|null [separatorKey, newRightPage] */
@@ -445,10 +481,14 @@ final class IndexBTree
     private function insertLeafCell(BTreePage $page, array $key): void
     {
         $cell = $this->makeLeafCell($key);
-        $cells = $page->cells;
-        $n = \count($cells);
-        if ($n === 0 || $this->compareKeys($key, $this->cellKey($cells[$n - 1])) > 0) {
+        $keys = $this->leafKeys($page);
+        $n = \count($keys);
+        // The mutators reset the page's key cache; re-apply the updated key
+        // list afterwards so later probes stay decode-free.
+        if ($n === 0 || $this->compareKeys($key, $keys[$n - 1]) > 0) {
             $page->appendCell($cell);
+            $keys[] = $key;
+            $page->keyCache = $keys;
             return;
         }
         // Binary-search the first cell whose key is >= the new key.
@@ -456,13 +496,15 @@ final class IndexBTree
         $hi = $n - 1;
         while ($lo < $hi) {
             $mid = ($lo + $hi) >> 1;
-            if ($this->compareKeys($this->cellKey($cells[$mid]), $key) < 0) {
+            if ($this->compareKeys($keys[$mid], $key) < 0) {
                 $lo = $mid + 1;
             } else {
                 $hi = $mid;
             }
         }
         $page->insertCell($lo, $cell);
+        \array_splice($keys, $lo, 0, [$key]);
+        $page->keyCache = $keys;
     }
 
     /** @return array{0:array<int,mixed>,1:int} */
@@ -521,13 +563,15 @@ final class IndexBTree
 
     private function childIndexFor(BTreePage $page, array $key): int
     {
-        $cells = $page->cells;
+        // Separators are ordered; binary-search the first cell whose separator
+        // is >= the search key (over the page's cached separator keys).
+        $seps = $this->interiorSepKeys($page);
         $lo = 0;
-        $hi = \count($cells) - 1;
+        $hi = \count($seps) - 1;
         $found = -1;
         while ($lo <= $hi) {
             $mid = ($lo + $hi) >> 1;
-            if ($this->compareKeys($key, $this->parseInteriorCell($cells[$mid])[1]) <= 0) {
+            if ($this->compareKeys($key, $seps[$mid]) <= 0) {
                 $found = $mid;
                 $hi = $mid - 1;
             } else {
